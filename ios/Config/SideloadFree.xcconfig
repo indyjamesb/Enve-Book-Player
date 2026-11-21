@@ -1,0 +1,13 @@
+// Free Personal Team settings for the iOS app target.
+// The Sideload build configuration is the only place this file is used.
+// Debug and Release keep the upstream bundle id, team, and entitlements.
+// Do not include this file in an upstream pull request.
+
+PRODUCT_BUNDLE_IDENTIFIER = com.indyjamesb.enve.test
+INFOPLIST_KEY_CFBundleDisplayName = Enve Test
+CODE_SIGN_ENTITLEMENTS = enve/Configuration/enve-sideload.entitlements
+REGISTER_APP_GROUPS = NO
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) SIDELOAD_FREE_APPLE_ID
+
+// DEVELOPMENT_TEAM is intentionally unset. Xcode should ask for the Personal Team.
+// Do not put the upstream team 9TT6DBK8W3 here.

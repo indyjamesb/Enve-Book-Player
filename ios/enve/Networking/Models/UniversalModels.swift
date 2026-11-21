@@ -340,6 +340,12 @@ struct ServerConnection: Identifiable, Codable, Hashable {
             }
             success = keychain.setCustomHeaderValue(value, headerName: headerName, forConnectionId: connectionId) && success
         }
+        #if SIDELOAD_FREE_APPLE_ID
+        // A free Personal Team cannot use the App Group keychain. Keep the secrets on this iPhone instead.
+        if !success {
+            success = SideloadKeychainFallback.persist(self)
+        }
+        #endif
         return success
     }
 
@@ -383,6 +389,9 @@ struct ServerConnection: Identifiable, Codable, Hashable {
             }
         }
         customHeaders = headers.isEmpty ? nil : headers
+        #if SIDELOAD_FREE_APPLE_ID
+        SideloadKeychainFallback.hydrate(&self)
+        #endif
     }
 
     func publicCustomHeadersForPersistence() -> [String: String]? {
