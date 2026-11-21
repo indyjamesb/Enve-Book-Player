@@ -81,6 +81,19 @@ struct PlexServer: Codable, Identifiable {
     var preferredURLString: String? {
         return preferredURL?.absoluteString
     }
+
+    var ownershipLabel: String {
+        owned ? "Your server" : "Shared with you"
+    }
+
+    /// Short reachability summary for the server picker: LAN, Remote, and Relay.
+    var connectionSummary: String {
+        var parts: [String] = []
+        if connections.contains(where: { $0.local && !$0.isRelay }) { parts.append("LAN") }
+        if connections.contains(where: { !$0.local && !$0.isRelay }) { parts.append("Remote") }
+        if connections.contains(where: \.isRelay) { parts.append("Relay") }
+        return parts.joined(separator: " · ")
+    }
 }
 
 struct PlexConnection: Codable {

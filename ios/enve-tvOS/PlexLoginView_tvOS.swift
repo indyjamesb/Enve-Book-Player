@@ -109,7 +109,10 @@ struct PlexLoginView_tvOS: View {
                     .foregroundStyle(hearth.textSecondary)
             } else {
                 List {
-                    ForEach(servers) { server in
+                    ForEach(servers.sorted { lhs, rhs in
+                        if lhs.owned != rhs.owned { return lhs.owned }
+                        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                    }) { server in
                         Button {
                             Task { await saveServer(server) }
                         } label: {
@@ -118,9 +121,14 @@ struct PlexLoginView_tvOS: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(server.name)
                                         .font(.headline)
-                                    Text(server.owned ? "Your server" : "Shared with you")
+                                    Text(server.ownershipLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                    if !server.connectionSummary.isEmpty {
+                                        Text(server.connectionSummary)
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                    }
                                 }
                             }
                         }
@@ -200,17 +208,20 @@ struct PlexLoginView_tvOS: View {
 
     @MainActor
     private func saveServer(_ server: PlexServer) async {
-
-        let uri =
-            server.connections.first(where: { $0.uri.hasPrefix("https://") })?.uri
-            ?? server.connections.first?.uri
-            ?? server.uri
+        phase = .loadingServers
+        guard let uri = await plexService.findBestConnection(server: server) else {
+            phase = .error(
+                "Couldn't reach \(server.name). Make sure the server is running, and that this Apple TV is on the same network or remote access is turned on."
+            )
+            return
+        }
 
         var connection = ServerConnection(
             name: server.name,
             url: uri,
             type: .plex,
-            token: server.accessToken
+            token: server.accessToken,
+            plexMachineIdentifier: server.id
         )
         connection.isConnected = true
         connection.lastVerified = Date()

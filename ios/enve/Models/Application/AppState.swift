@@ -24,6 +24,9 @@ public class AppState {
     private let networkMonitor = NWPathMonitor()
     private let networkQueue = DispatchQueue(label: "NetworkMonitor")
     private var networkWasEverUnsatisfied = false
+    private var lastNetworkPath: PlexNetworkPathSnapshot?
+    private var plexReresolvePending = false
+    private var plexReresolveRunning = false
     var currentBook: Book? {
         didSet {
             if let old = oldValue?.uniqueId { hotCache.unpin(uniqueId: old) }
@@ -533,16 +536,80 @@ public class AppState {
         }
         notificationObservers.append(observer)
         networkMonitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            let wifi = path.usesInterfaceType(.wifi)
+            let cellular = path.usesInterfaceType(.cellular)
             Task { @MainActor [weak self] in
                 guard let self, !self.isRetiring else { return }
-                if path.status != .satisfied {
+                let snapshot = PlexNetworkPathSnapshot(satisfied: satisfied, usesWiFi: wifi, usesCellular: cellular)
+                let previous = self.lastNetworkPath
+                self.lastNetworkPath = snapshot
+                if !snapshot.satisfied {
                     self.networkWasEverUnsatisfied = true
                 } else if self.networkWasEverUnsatisfied {
                     self.retainOperation { [weak self] in await self?.progress.retryPendingSyncs() }
                 }
+                guard PlexNetworkPathSnapshot.shouldReresolve(from: previous, to: snapshot) else { return }
+                self.schedulePlexReresolve()
             }
         }
         networkMonitor.start(queue: networkQueue)
+    }
+
+    /// Re-probes saved Plex servers after a network change. Playback keeps using the last good URL until a better one answers.
+    private func schedulePlexReresolve() {
+        plexReresolvePending = true
+        guard !plexReresolveRunning else { return }
+        plexReresolveRunning = true
+        retainOperation { [weak self] in
+            guard let self else { return }
+            while self.plexReresolvePending {
+                self.plexReresolvePending = false
+                await self.reresolvePlexConnections()
+            }
+            self.plexReresolveRunning = false
+        }
+    }
+
+    private func reresolvePlexConnections() async {
+        let current = providerConnections.connections
+        let plexConnections = current.filter { $0.type == .plex && $0.isConnected && !$0.isArchived }
+        guard !plexConnections.isEmpty else { return }
+
+        let service = PlexService()
+        let accountToken = profileSession?.plexAuth.loadToken()
+        var next = current
+        var changed = false
+
+        for connection in plexConnections {
+            if Task.isCancelled { return }
+            let discoveryToken = connection.plexOwnerToken ?? accountToken
+            guard let discoveryToken, !discoveryToken.isEmpty else { continue }
+            let servers: [PlexServer]
+            do {
+                servers = try await service.getPlexServers(
+                    token: discoveryToken,
+                    ownerToken: connection.plexOwnerToken,
+                    switchedUserId: connection.plexHomeUserId
+                )
+            } catch {
+                continue
+            }
+            let endpoint = await PlexConnectionRefresh.resolvedEndpoint(for: connection, servers: servers) { server in
+                await service.findBestConnection(server: server, recordGlobally: false)
+            }
+            let updated = PlexConnectionRefresh.updated(connection, with: endpoint)
+            guard updated.url != connection.url || updated.plexMachineIdentifier != connection.plexMachineIdentifier else {
+                continue
+            }
+            guard let index = next.firstIndex(where: { $0.id == connection.id }) else { continue }
+            next[index] = updated
+            changed = true
+        }
+
+        if changed, !Task.isCancelled {
+            providerConnections.connections = next
+        }
     }
 
     @MainActor func updateBookWithMetadata(_ updatedBook: Book) {

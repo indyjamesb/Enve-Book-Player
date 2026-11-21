@@ -91,6 +91,13 @@ public class PlexService: @unchecked Sendable {
         #endif
     }
 
+    /// Reachability probes. Injected with `session` in tests; production uses a short-timeout session.
+    private let probeSession: URLSession
+
+    /// Unreachable LAN addresses must not stall remote discovery.
+    static let localConnectionBudget: TimeInterval = 1.5
+    static let remoteConnectionBudget: TimeInterval = 4
+
     public init(session: URLSession? = nil, storageService: StorageService = StorageService()) {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 30
@@ -98,6 +105,9 @@ public class PlexService: @unchecked Sendable {
         configuration.waitsForConnectivity = true
 
         self.session = session ?? URLSession(configuration: configuration)
+        // A caller-supplied session (tests, URLProtocol stubs) probes through that session.
+        // Production plex.tv calls keep the long session above; LAN/WAN probes do not.
+        self.probeSession = session ?? Self.makeIdentityProbeSession()
         self.storageService = storageService
 
         self.product =
@@ -499,116 +509,179 @@ public class PlexService: @unchecked Sendable {
         return port.isEmpty ? host : "\(host):\(port)"
     }
 
-    func verifyConnection(url: String, token: String) async -> Bool {
-        guard let baseURL = URL(string: url) else {
-            return false
-        }
-        let redactedURL = baseURL.redacted.absoluteString
+    /// Local non-relay addresses first, then remote, then relay. Each tier runs concurrently.
+    /// `recordGlobally` mirrors the winner into the legacy single-server defaults; network refresh passes false.
+    func findBestConnection(server: PlexServer, recordGlobally: Bool = true) async -> String? {
+        AppLogger.network.info("Finding best connection for server: \(server.name)")
 
-        let probePaths = ["/library/sections", "/identity"]
+        let tiers: [(connections: [PlexConnection], budget: TimeInterval)] = [
+            (server.connections.filter { $0.local && !$0.isRelay }, Self.localConnectionBudget),
+            (server.connections.filter { !$0.local && !$0.isRelay }, Self.remoteConnectionBudget),
+            (server.connections.filter(\.isRelay), Self.remoteConnectionBudget),
+        ]
 
-        for path in probePaths {
-            guard let probeURL = URL(string: path, relativeTo: baseURL) else { continue }
-
-            var components = URLComponents(url: probeURL, resolvingAgainstBaseURL: true)
-            var items = components?.queryItems ?? []
-            items.append(URLQueryItem(name: "X-Plex-Token", value: token))
-            components?.queryItems = items
-
-            guard let finalURL = components?.url else { continue }
-
-            var request = URLRequest(url: finalURL)
-            request.setValue("application/xml", forHTTPHeaderField: "Accept")
-            applyPlexHeaders(&request, token: token)
-            request.timeoutInterval = 3.0
-
-            do {
-                let (_, response) = try await session.data(for: request)
-                if let httpResponse = response as? HTTPURLResponse {
-                    let success = httpResponse.statusCode == 200
-                    AppLogger.network.error("Tested \(redactedURL)\(path): \(success ? " OK" : " Failed (\(httpResponse.statusCode))")")
-                    if success {
-                        return true
-                    }
-                    continue
+        for tier in tiers where !tier.connections.isEmpty {
+            if let uri = await firstReachable(in: tier.connections, budget: tier.budget, token: server.accessToken) {
+                AppLogger.network.info("Found a working Plex connection for \(server.name)")
+                if recordGlobally {
+                    PlexAuthStore.shared.saveServerUrl(uri)
+                    PlexAuthStore.shared.saveMachineIdentifier(server.id)
+                    PlexAuthStore.shared.saveServerAccessToken(server.accessToken)
                 }
-
-                AppLogger.network.info("Tested \(redactedURL)\(path): Non-HTTP response")
-            } catch {
-                let nsError = error as NSError
-                AppLogger.network.error(
-                    "Tested \(redactedURL)\(path): Failed (\(nsError.domain) \(nsError.code)) \(nsError.localizedDescription)"
-                )
+                return uri
             }
         }
 
-        return false
+        AppLogger.network.info("No working Plex connection for \(server.name)")
+        return nil
     }
 
-    func findBestConnection(server: PlexServer) async -> String? {
-        AppLogger.network.info("Finding best connection for server: \(server.name)")
-        AppLogger.network.info("Testing all Plex connections; local addresses are not assumed reachable")
+    /// Short timeouts, no connectivity wait, and the same private-host trust as the rest of the app.
+    private static func makeIdentityProbeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = remoteConnectionBudget
+        configuration.timeoutIntervalForResource = remoteConnectionBudget
+        configuration.waitsForConnectivity = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(
+            configuration: configuration,
+            delegate: InsecureURLSession.delegateInstance,
+            delegateQueue: nil
+        )
+    }
 
-        let sortedConnections = server.connections.sorted { conn1, conn2 in
-            let conn1SecureRemote = conn1.isSecure && !conn1.local && !conn1.isRelay
-            let conn2SecureRemote = conn2.isSecure && !conn2.local && !conn2.isRelay
-            if conn1SecureRemote != conn2SecureRemote {
-                return conn1SecureRemote
+    /// Lower rank is better. plex.direct HTTPS beats a raw IP in the same tier.
+    private static func probeRank(_ connection: PlexConnection) -> Int {
+        if connection.isPlexDirect && connection.isSecure { return 0 }
+        if connection.isSecure { return 1 }
+        return 2
+    }
+
+    private enum ProbeOutcome: Sendable {
+        case success(rank: Int, uri: String)
+        case finished
+        case budget
+    }
+
+    private func firstReachable(in connections: [PlexConnection], budget: TimeInterval, token: String) async -> String? {
+        let ranked = connections.enumerated().map { index, connection in
+            (index: index, connection: connection, rank: Self.probeRank(connection))
+        }.sorted { lhs, rhs in
+            if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
+            return lhs.index < rhs.index
+        }
+        guard let bestRank = ranked.first?.rank else { return nil }
+
+        let headers = headerContext
+        let session = probeSession
+        return await withTaskGroup(of: ProbeOutcome.self) { group in
+            for item in ranked {
+                let uri = item.connection.uri
+                let rank = item.rank
+                group.addTask {
+                    if Task.isCancelled { return .finished }
+                    let reachable = await Self.probeIdentity(
+                        url: uri,
+                        token: token,
+                        timeout: budget,
+                        session: session,
+                        headers: headers
+                    )
+                    return reachable ? .success(rank: rank, uri: uri) : .finished
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(budget * 1_000_000_000))
+                return .budget
             }
 
-            let conn1SecureLocal = conn1.isSecure && conn1.local && !conn1.isRelay
-            let conn2SecureLocal = conn2.isSecure && conn2.local && !conn2.isRelay
-            if conn1SecureLocal != conn2SecureLocal {
-                return conn1SecureLocal
+            var best: (rank: Int, uri: String)?
+            var remaining = ranked.count
+            while let outcome = await group.next() {
+                switch outcome {
+                case .success(let rank, let uri):
+                    remaining -= 1
+                    if best == nil || rank < best!.rank {
+                        best = (rank, uri)
+                    }
+                    if best?.rank == bestRank || remaining == 0 {
+                        group.cancelAll()
+                        return best?.uri
+                    }
+                case .finished:
+                    remaining -= 1
+                    if remaining == 0 {
+                        group.cancelAll()
+                        return best?.uri
+                    }
+                case .budget:
+                    group.cancelAll()
+                    return best?.uri
+                }
             }
+            return best?.uri
+        }
+    }
 
-            let conn1InsecureRemote = !conn1.isSecure && !conn1.local && !conn1.isRelay
-            let conn2InsecureRemote = !conn2.isSecure && !conn2.local && !conn2.isRelay
-            if conn1InsecureRemote != conn2InsecureRemote {
-                return conn1InsecureRemote
-            }
+    private struct PlexHeaderContext: Sendable {
+        var product: String
+        var appVersion: String
+        var deviceModel: String
+        var deviceName: String
+        var platformVersion: String
+        var clientIdentifier: String
+    }
 
-            let conn1InsecureLocal = !conn1.isSecure && conn1.local && !conn1.isRelay
-            let conn2InsecureLocal = !conn2.isSecure && conn2.local && !conn2.isRelay
-            if conn1InsecureLocal != conn2InsecureLocal {
-                return conn1InsecureLocal
-            }
+    private var headerContext: PlexHeaderContext {
+        PlexHeaderContext(
+            product: product,
+            appVersion: appVersion,
+            deviceModel: deviceModel,
+            deviceName: deviceName,
+            platformVersion: platformVersion,
+            clientIdentifier: clientIdentifier
+        )
+    }
 
-            if conn1.isRelay != conn2.isRelay {
-                return !conn1.isRelay
-            }
-
+    /// Confirms the base URL with Plex's `/identity` resource. Nonisolated so the tier can probe in parallel.
+    private nonisolated static func probeIdentity(
+        url: String,
+        token: String,
+        timeout: TimeInterval,
+        session: URLSession,
+        headers: PlexHeaderContext
+    ) async -> Bool {
+        guard let baseURL = URL(string: url),
+            let probeURL = URL(string: "/identity", relativeTo: baseURL)
+        else {
             return false
         }
+        var components = URLComponents(url: probeURL, resolvingAgainstBaseURL: true)
+        var items = components?.queryItems ?? []
+        items.removeAll { $0.name == "X-Plex-Token" }
+        items.append(URLQueryItem(name: "X-Plex-Token", value: token))
+        components?.queryItems = items
+        guard let finalURL = components?.url else { return false }
 
-        AppLogger.network.info("Testing \(sortedConnections.count) connection(s) in priority order...")
+        var request = URLRequest(url: finalURL)
+        request.timeoutInterval = timeout
+        request.setValue("application/xml", forHTTPHeaderField: "Accept")
+        request.setValue(headers.product, forHTTPHeaderField: "X-Plex-Product")
+        request.setValue(headers.appVersion, forHTTPHeaderField: "X-Plex-Version")
+        request.setValue(headers.deviceModel, forHTTPHeaderField: "X-Plex-Device")
+        request.setValue(headers.deviceName, forHTTPHeaderField: "X-Plex-Device-Name")
+        request.setValue("iOS", forHTTPHeaderField: "X-Plex-Platform")
+        request.setValue(headers.platformVersion, forHTTPHeaderField: "X-Plex-Platform-Version")
+        request.setValue(headers.clientIdentifier, forHTTPHeaderField: "X-Plex-Client-Identifier")
+        request.setValue("player", forHTTPHeaderField: "X-Plex-Provides")
+        request.setValue(token, forHTTPHeaderField: "X-Plex-Token")
 
-        for (index, connection) in sortedConnections.enumerated() {
-            let connectionType: String
-            if connection.isRelay {
-                connectionType = "Relay"
-            } else if connection.local {
-                connectionType = connection.isSecure ? "Local HTTPS" : "Local HTTP"
-            } else {
-                connectionType = connection.isSecure ? "Remote HTTPS" : "Remote HTTP"
-            }
-
-            AppLogger.network.info("[\(index + 1)/\(sortedConnections.count)] Testing \(connectionType): \(connection.uri)")
-
-            if await verifyConnection(url: connection.uri, token: server.accessToken) {
-                AppLogger.network.info("Found working connection: \(connection.uri)")
-                AppLogger.network.info("Type: \(connectionType)")
-                PlexAuthStore.shared.saveServerUrl(connection.uri)
-                PlexAuthStore.shared.saveMachineIdentifier(server.id)
-                PlexAuthStore.shared.saveServerAccessToken(server.accessToken)
-                return connection.uri
-            } else {
-                AppLogger.network.error("Connection failed - trying next...")
-            }
+        do {
+            let (_, response) = try await session.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
         }
-
-        AppLogger.network.info("No working connection found after testing all \(sortedConnections.count) connection(s)")
-        return nil
     }
 
     func getChapters(serverUrl: String, token: String, ratingKey: String) async throws -> [Chapter] {

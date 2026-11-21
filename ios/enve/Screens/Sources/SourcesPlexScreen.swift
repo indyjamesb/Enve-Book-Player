@@ -26,6 +26,7 @@ struct SourcesPlexScreen: View {
     @State private var selectedHomeUser: PlexHomeUser?
     @State private var showingUserPicker = false
     @State private var servers: [PlexServer] = []
+    @State private var probingServerID: String?
     @State private var isBusy = false
     @State private var error: String?
     @State private var manualToken = ""
@@ -193,7 +194,7 @@ struct SourcesPlexScreen: View {
                         .foregroundStyle(hearth.textSecondary)
                 }
             } else {
-                ForEach(servers) { server in
+                ForEach(sortedServers) { server in
                     Button {
                         selectServer(server)
                     } label: {
@@ -202,19 +203,28 @@ struct SourcesPlexScreen: View {
                                 Text(server.name)
                                     .font(.hearthBody.weight(.medium))
                                     .foregroundStyle(hearth.text)
-                                Text("Plex Media Server")
+                                Text(server.ownershipLabel)
                                     .font(.hearthCaption)
                                     .foregroundStyle(hearth.textSecondary)
+                                if !server.connectionSummary.isEmpty {
+                                    Text(server.connectionSummary)
+                                        .font(.hearthCaption)
+                                        .foregroundStyle(hearth.textTertiary)
+                                }
                             }
                             Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.hearthUI(12, weight: .semibold))
-                                .foregroundStyle(hearth.textTertiary)
+                            if probingServerID == server.id {
+                                ProgressView()
+                                    .tint(hearth.ember)
+                            } else {
+                                Image(systemName: "chevron.right")
+                                    .font(.hearthUI(12, weight: .semibold))
+                                    .foregroundStyle(hearth.textTertiary)
+                            }
                         }
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(PressableStyle())
-                    .disabled(isBusy)
                 }
             }
 
@@ -229,6 +239,13 @@ struct SourcesPlexScreen: View {
                     .font(.hearthCaption)
                     .foregroundStyle(hearth.ember)
             }
+        }
+    }
+
+    private var sortedServers: [PlexServer] {
+        servers.sorted { lhs, rhs in
+            if lhs.owned != rhs.owned { return lhs.owned }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
     }
 
@@ -373,7 +390,8 @@ struct SourcesPlexScreen: View {
     }
 
     private func selectServer(_ server: PlexServer) {
-        isBusy = true
+        guard probingServerID == nil else { return }
+        probingServerID = server.id
         error = nil
 
         Task {
@@ -382,28 +400,34 @@ struct SourcesPlexScreen: View {
 
             guard let workingURL = await service.findBestConnection(server: server) else {
                 self.error =
-                    "Couldn't reach \(server.name). Check that remote access is enabled or that this Mac can reach the server's local network."
-                self.isBusy = false
+                    "Couldn't reach \(server.name). Make sure the server is running, and that this iPhone is on the same network or remote access is turned on."
+                self.probingServerID = nil
                 return
             }
 
             do {
-                try await verifyAndAdd(name: server.name, url: workingURL, serverToken: token)
+                try await verifyAndAdd(
+                    name: server.name,
+                    url: workingURL,
+                    serverToken: token,
+                    machineIdentifier: server.id
+                )
             } catch {
                 self.error = "Couldn't add \(server.name): \(error.localizedDescription)"
-                self.isBusy = false
+                self.probingServerID = nil
             }
         }
     }
 
-    private func verifyAndAdd(name: String, url: String, serverToken: String) async throws {
+    private func verifyAndAdd(name: String, url: String, serverToken: String, machineIdentifier: String) async throws {
         var temp = ServerConnection(
             name: name,
             url: url,
             type: .plex,
             token: serverToken,
             isConnected: false,
-            authMode: .auto
+            authMode: .auto,
+            plexMachineIdentifier: machineIdentifier
         )
         temp.plexOwnerToken = ownerToken ?? (selectedHomeUser?.isAdmin == true ? serverToken : nil)
         if let homeUser = selectedHomeUser, !homeUser.isAdmin {
@@ -417,7 +441,7 @@ struct SourcesPlexScreen: View {
         let (isValid, validated) = try await appState.validateConnection(temp)
         guard isValid else {
             error = "Connection failed. Please try again."
-            isBusy = false
+            probingServerID = nil
             return
         }
 

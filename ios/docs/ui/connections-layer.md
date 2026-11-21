@@ -29,7 +29,7 @@ Stored fields:
 - `customHeaders: [String: String]?`, `secretCustomHeaderNames: Set<String>` (auto-classified secret headers; see `isSecretHeaderName`)
 - `authMode: ConnectionAuthMode`, `mtlsEnabled: Bool`
 - `grimmoryOIDCRedirectURI: String?` (per-connection OIDC redirect override — must persist, provider validates exact match)
-- Plex Home user block: `plexHomeUserId/Name/Thumb/Token: String?`, `plexHomeUserIsManaged: Bool?`, `plexOwnerToken: String?`; computed `effectivePlexToken` (home token wins).
+- Plex Home user block: `plexHomeUserId/Name/Thumb/Token: String?`, `plexHomeUserIsManaged: Bool?`, `plexOwnerToken: String?`; computed `effectivePlexToken` (home token wins). `plexMachineIdentifier: String?` is the Plex resource `clientIdentifier`, decoded with `decodeIfPresent` so older saved connections still load. Playback and progress use the connection that owns the book; the machine id picks that server out of a multi-server account.
 
 **Codable contract (critical):** custom `encode(to:)` **strips all secrets** (token, password, plexHomeUserToken, plexOwnerToken, secret custom-header values) out of the JSON and writes them to `SharedKeychainStore` first (throws if keychain write fails); custom `init(from:)` calls `hydrateSecretsFromSharedKeychain()` to put them back. Helper methods: `persistSecretsToSharedKeychain()`, `hydrateSecretsFromSharedKeychain()`, `publicCustomHeadersForPersistence()`, `allSecretCustomHeaderNames()`.
 

@@ -192,15 +192,20 @@ final class PlayerStreamURLResolver {
             var backendId = book.backendId
 
             if backendId == nil {
-                AppLogger.player.info("No backendId on book, searching for enabled Plex backend...")
-                let allBackends = providerConnections.allBackends()
-                if let plexBackend = allBackends.first(where: { $0.type == .plex && $0.enabled }) {
-                    AppLogger.player.debug(
-                        "Found Plex backend diagnosticID=\(DiagnosticLogSanitizer.identifier(for: plexBackend.id))"
-                    )
-                    backendId = plexBackend.id
+                AppLogger.player.info("No backendId on book, searching for the Plex connection that owns it...")
+                if let saved = PlexPlaybackEndpoint.connection(
+                    backendId: book.backendId,
+                    providerId: book.providerId,
+                    connections: providerConnections.connections
+                ) {
+                    backendId = saved.id.uuidString
                 } else {
-                    AppLogger.player.info("No enabled Plex backends found")
+                    let plexBackends = providerConnections.allBackends().filter { $0.type == .plex && $0.enabled }
+                    if plexBackends.count == 1, let only = plexBackends.first {
+                        backendId = only.id
+                    } else {
+                        AppLogger.player.info("No single Plex connection matches this book")
+                    }
                 }
             }
 
@@ -293,7 +298,13 @@ final class PlayerStreamURLResolver {
                 )
             }
 
-            guard let workingServerUrl = await getWorkingServerUrl(token: discoveryToken) else {
+            let machineIdentifier =
+                PlexPlaybackEndpoint.connection(
+                    backendId: book.backendId,
+                    providerId: book.providerId,
+                    connections: providerConnections.connections
+                )?.plexMachineIdentifier ?? profileSession.plexAuth.loadMachineIdentifier()
+            guard let workingServerUrl = await getWorkingServerUrl(token: discoveryToken, machineIdentifier: machineIdentifier) else {
                 throw NSError(
                     domain: "PlayerStreamURLResolver",
                     code: -1,
@@ -799,10 +810,27 @@ final class PlayerStreamURLResolver {
         return true
     }
 
-    private func getWorkingServerUrl(token: String) async -> String? {
+    /// Uses the saved URL for this machine. A reachability race runs only when nothing is saved yet, not on every play.
+    private func getWorkingServerUrl(token: String, machineIdentifier: String?) async -> String? {
+        let saved = providerConnections.connections.filter {
+            $0.type == .plex && !$0.isArchived && $0.isConnected && !$0.url.isEmpty
+        }
+        if let machineIdentifier, !machineIdentifier.isEmpty,
+            let match = saved.first(where: { $0.plexMachineIdentifier == machineIdentifier })
+        {
+            return match.url
+        }
+        if (machineIdentifier == nil || machineIdentifier?.isEmpty == true), saved.count == 1 {
+            return saved[0].url
+        }
         do {
             let servers = try await plexService.getPlexServers(token: token)
-            guard let server = servers.first else { return nil }
+            guard let server = PlexServerMatching.server(matching: machineIdentifier, in: servers) else {
+                return nil
+            }
+            if let savedURL = saved.first(where: { $0.plexMachineIdentifier == server.id })?.url, !savedURL.isEmpty {
+                return savedURL
+            }
             return await plexService.findBestConnection(server: server)
         } catch {
             AppLogger.player.error("Failed to get working server URL: \(error)")

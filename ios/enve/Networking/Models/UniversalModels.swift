@@ -148,6 +148,8 @@ struct ServerConnection: Identifiable, Codable, Hashable {
     var plexHomeUserToken: String?
     var plexHomeUserIsManaged: Bool?
     var plexOwnerToken: String?
+    /// Plex machine identifier (`clientIdentifier` on the resource). Optional so connections saved before this field still decode.
+    var plexMachineIdentifier: String?
 
     var effectivePlexToken: String? {
         if type == .plex, let homeToken = plexHomeUserToken, !homeToken.isEmpty {
@@ -193,7 +195,8 @@ struct ServerConnection: Identifiable, Codable, Hashable {
         plexHomeUserThumb: String? = nil,
         plexHomeUserToken: String? = nil,
         plexHomeUserIsManaged: Bool? = nil,
-        plexOwnerToken: String? = nil
+        plexOwnerToken: String? = nil,
+        plexMachineIdentifier: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -220,6 +223,7 @@ struct ServerConnection: Identifiable, Codable, Hashable {
         self.plexHomeUserToken = plexHomeUserToken
         self.plexHomeUserIsManaged = plexHomeUserIsManaged
         self.plexOwnerToken = plexOwnerToken
+        self.plexMachineIdentifier = plexMachineIdentifier
     }
 
     enum CodingKeys: String, CodingKey {
@@ -227,6 +231,7 @@ struct ServerConnection: Identifiable, Codable, Hashable {
             isArchived, rootPath, customHeaders, secretCustomHeaderNames, authMode, mtlsEnabled
         case grimmoryOIDCRedirectURI, komgaOAuthProviderId
         case plexHomeUserId, plexHomeUserName, plexHomeUserThumb, plexHomeUserToken, plexHomeUserIsManaged, plexOwnerToken
+        case plexMachineIdentifier
     }
 
     init(from decoder: Decoder) throws {
@@ -258,6 +263,7 @@ struct ServerConnection: Identifiable, Codable, Hashable {
         plexHomeUserToken = try container.decodeIfPresent(String.self, forKey: .plexHomeUserToken)
         plexHomeUserIsManaged = try container.decodeIfPresent(Bool.self, forKey: .plexHomeUserIsManaged)
         plexOwnerToken = try container.decodeIfPresent(String.self, forKey: .plexOwnerToken)
+        plexMachineIdentifier = try container.decodeIfPresent(String.self, forKey: .plexMachineIdentifier)
 
         hydrateSecretsFromSharedKeychain(using: decoder.userInfo[Self.keychainUserInfoKey] as? SharedKeychainStore ?? .shared)
     }
@@ -307,6 +313,7 @@ struct ServerConnection: Identifiable, Codable, Hashable {
         try container.encodeIfPresent(plexHomeUserName, forKey: .plexHomeUserName)
         try container.encodeIfPresent(plexHomeUserThumb, forKey: .plexHomeUserThumb)
         try container.encodeIfPresent(plexHomeUserIsManaged, forKey: .plexHomeUserIsManaged)
+        try container.encodeIfPresent(plexMachineIdentifier, forKey: .plexMachineIdentifier)
     }
 
     @discardableResult

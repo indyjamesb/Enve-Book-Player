@@ -212,6 +212,9 @@ final class ServerConnectionCloudKitSync {
         }
         record["mtlsEnabled"] = (connection.mtlsEnabled ? 1 : 0) as CKRecordValue
         record["isArchived"] = (connection.isArchived ? 1 : 0) as CKRecordValue
+        if let plexMachineIdentifier = connection.plexMachineIdentifier, !plexMachineIdentifier.isEmpty {
+            record["plexMachineIdentifier"] = plexMachineIdentifier as CKRecordValue
+        }
         return record
     }
 
@@ -259,6 +262,7 @@ final class ServerConnectionCloudKitSync {
         if let archived = record["isArchived"] as? Int {
             connection.isArchived = (archived != 0)
         }
+        connection.plexMachineIdentifier = record["plexMachineIdentifier"] as? String
 
         connection.hydrateSecretsFromSharedKeychain()
 
@@ -293,6 +297,7 @@ final class ServerConnectionCloudKitSync {
         if combined.password == nil { combined.password = local.password }
         if combined.plexHomeUserToken == nil { combined.plexHomeUserToken = local.plexHomeUserToken }
         if combined.plexOwnerToken == nil { combined.plexOwnerToken = local.plexOwnerToken }
+        if combined.plexMachineIdentifier == nil { combined.plexMachineIdentifier = local.plexMachineIdentifier }
 
         let secretHeaderNames = combined.allSecretCustomHeaderNames().union(local.allSecretCustomHeaderNames())
         combined.secretCustomHeaderNames = secretHeaderNames
