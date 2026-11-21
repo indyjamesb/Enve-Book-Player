@@ -77,9 +77,9 @@ public class PlayerProgressService {
         }
 
         if profileSession.serverSyncEnabled, book.source == .plex,
-            let serverUrl = profileSession.plexAuth.loadServerUrl(),
-            let token = profileSession.plexAuth.loadToken(),
-            let plexResult = try? await plexService.fetchProgress(serverUrl: serverUrl, token: token, ratingKey: book.ratingKey)
+            let resolved = await MainActor.run(body: { plexProgressEndpoint(for: book) }),
+            let plexResult = try? await plexService.fetchProgress(
+                serverUrl: resolved.url, token: resolved.token, ratingKey: book.ratingKey)
         {
             let plexSeconds = plexResult.offset
             if remoteProgress == nil || abs(plexSeconds - (remoteProgress ?? 0)) > 30 {
@@ -175,5 +175,24 @@ public class PlayerProgressService {
     public func stopProgressSync() {
         progressSyncTimer?.invalidate()
         progressSyncTimer = nil
+    }
+
+    /// The book's own Plex connection when one is known. The legacy global URL is only the fallback.
+    @MainActor
+    private func plexProgressEndpoint(for book: Book) -> (url: String, token: String)? {
+        if let connection = PlexPlaybackEndpoint.connection(
+            backendId: book.backendId,
+            providerId: book.providerId,
+            connections: providerConnections.connections
+        ), let token = connection.effectivePlexToken ?? connection.token, !token.isEmpty {
+            return (connection.url, token)
+        }
+        if let url = profileSession.plexAuth.loadServerUrl(),
+            let token = profileSession.plexAuth.loadToken(),
+            !url.isEmpty, !token.isEmpty
+        {
+            return (url, token)
+        }
+        return nil
     }
 }
